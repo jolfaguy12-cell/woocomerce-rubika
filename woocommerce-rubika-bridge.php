@@ -1450,7 +1450,13 @@ if (!class_exists('WCRB_Plugin')) {
                 return;
             }
 
-            $wpdb->update($table, array('status' => 'processing'), array('id' => $item->id), array('%s'), array('%d'));
+            $claimed = (bool) $wpdb->query($wpdb->prepare(
+                "UPDATE {$table} SET status = 'processing' WHERE id = %d AND status = 'pending'",
+                $item->id
+            ));
+            if (!$claimed) {
+                return;
+            }
 
             $network = $this->normalize_network($item->network ?? 'rubika');
             $product_id = (int) $item->product_id;
@@ -1948,48 +1954,82 @@ if (!class_exists('WCRB_Plugin')) {
                 return array('success' => false, 'message' => 'Could not get upload URL');
             }
 
-            $raw_upload_body = '';
+            $raw_upload_body   = '';
+            $upload_http_code  = 0;
+            $upload_effective_url = '';
+
             if (function_exists('curl_init') && class_exists('CURLFile')) {
                 $curl = curl_init();
                 curl_setopt_array($curl, array(
-                    CURLOPT_URL => $upload_url,
-                    CURLOPT_POST => true,
+                    CURLOPT_URL            => $upload_url,
+                    CURLOPT_POST           => true,
                     CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_TIMEOUT => 60,
-                    CURLOPT_POSTFIELDS => array(
+                    CURLOPT_TIMEOUT        => 60,
+                    CURLOPT_FOLLOWLOCATION => true,
+                    CURLOPT_POSTFIELDS     => array(
                         'file' => new CURLFile($path, 'image/jpeg', basename($path)),
                     ),
                 ));
-                $curl_response = curl_exec($curl);
+                $curl_response        = curl_exec($curl);
+                $upload_http_code     = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+                $upload_effective_url = (string) curl_getinfo($curl, CURLINFO_EFFECTIVE_URL);
+                $curl_errno           = curl_errno($curl);
+                $curl_error_str       = $curl_errno ? curl_error($curl) : '';
+                curl_close($curl);
+
                 if ($curl_response !== false) {
                     $raw_upload_body = (string) $curl_response;
                 }
-                curl_close($curl);
+
+                if ($curl_errno || ($upload_http_code > 0 && ($upload_http_code < 200 || $upload_http_code >= 300))) {
+                    $this->add_log('error', 'Rubika cURL upload non-2xx or transport error.', array(
+                        'product_id'      => $product_id,
+                        'attachment_id'   => $attachment_id,
+                        'http_code'       => $upload_http_code,
+                        'effective_url'   => ($upload_effective_url && $upload_effective_url !== $upload_url) ? $upload_effective_url : null,
+                        'curl_error'      => $curl_error_str ?: null,
+                        'is_html'         => (bool) preg_match('/<html/i', $raw_upload_body),
+                        'response_sample' => mb_substr(wp_strip_all_tags($raw_upload_body), 0, 300),
+                    ));
+                }
             }
 
             if ($raw_upload_body === '') {
-                $file_part = function_exists('curl_file_create') ? curl_file_create($path, 'image/jpeg', basename($path)) : '@' . $path;
                 $response = wp_remote_post($upload_url, array(
                     'timeout' => 60,
-                    'body' => array(
-                        'file' => $file_part,
+                    'body'    => array(
+                        'file' => function_exists('curl_file_create') ? curl_file_create($path, 'image/jpeg', basename($path)) : '@' . $path,
                     ),
                 ));
 
                 if (is_wp_error($response)) {
                     $this->cleanup_prepared_image($prepared, $attachment_id, $product_id);
                     $this->add_log('error', 'Rubika multipart image upload failed.', array(
-                        'product_id' => $product_id,
+                        'product_id'    => $product_id,
                         'attachment_id' => $attachment_id,
-                        'reason' => $response->get_error_message(),
+                        'reason'        => $response->get_error_message(),
                     ));
                     return array('success' => false, 'message' => $response->get_error_message());
                 }
 
+                $wp_http_code    = (int) wp_remote_retrieve_response_code($response);
                 $raw_upload_body = wp_remote_retrieve_body($response);
+                if ($upload_http_code === 0) {
+                    $upload_http_code = $wp_http_code;
+                }
+
+                if ($wp_http_code < 200 || $wp_http_code >= 300) {
+                    $this->add_log('error', 'Rubika wp_remote_post upload non-2xx.', array(
+                        'product_id'      => $product_id,
+                        'attachment_id'   => $attachment_id,
+                        'http_code'       => $wp_http_code,
+                        'is_html'         => (bool) preg_match('/<html/i', $raw_upload_body),
+                        'response_sample' => mb_substr(wp_strip_all_tags($raw_upload_body), 0, 300),
+                    ));
+                }
             }
 
-            $json = json_decode($raw_upload_body, true);
+            $json    = json_decode($raw_upload_body, true);
             $file_id = $this->extract_file_id_from_upload_response($json);
 
             if (empty($file_id)) {
@@ -1998,28 +2038,44 @@ if (!class_exists('WCRB_Plugin')) {
                     'headers' => array(
                         'Content-Type' => 'image/jpeg',
                     ),
-                    'body' => file_get_contents($path),
+                    'body'    => @file_get_contents($path),
                 ));
 
                 if (!is_wp_error($fallback_response)) {
-                    $fallback_raw = wp_remote_retrieve_body($fallback_response);
+                    $fb_http_code  = (int) wp_remote_retrieve_response_code($fallback_response);
+                    $fallback_raw  = wp_remote_retrieve_body($fallback_response);
+                    if ($upload_http_code === 0) {
+                        $upload_http_code = $fb_http_code;
+                    }
                     $fallback_json = json_decode($fallback_raw, true);
-                    $file_id = $this->extract_file_id_from_upload_response($fallback_json);
+                    $file_id       = $this->extract_file_id_from_upload_response($fallback_json);
                     if (empty($file_id)) {
                         $raw_upload_body = $fallback_raw;
+                        if ($fb_http_code < 200 || $fb_http_code >= 300) {
+                            $this->add_log('error', 'Rubika raw-body upload fallback non-2xx.', array(
+                                'product_id'      => $product_id,
+                                'attachment_id'   => $attachment_id,
+                                'http_code'       => $fb_http_code,
+                                'is_html'         => (bool) preg_match('/<html/i', $fallback_raw),
+                                'response_sample' => mb_substr(wp_strip_all_tags($fallback_raw), 0, 300),
+                            ));
+                        }
                     }
                 }
             }
 
             if (empty($file_id)) {
-                $body_for_log = is_string($raw_upload_body) ? mb_substr($raw_upload_body, 0, 400) : '';
+                $body_for_log = is_string($raw_upload_body) ? $raw_upload_body : '';
                 $this->cleanup_prepared_image($prepared, $attachment_id, $product_id);
                 $this->add_log('error', 'Rubika image upload returned no file_id.', array(
-                    'product_id' => $product_id,
-                    'attachment_id' => $attachment_id,
-                    'response' => $body_for_log,
+                    'product_id'      => $product_id,
+                    'attachment_id'   => $attachment_id,
+                    'http_code'       => $upload_http_code,
+                    'effective_url'   => ($upload_effective_url && $upload_effective_url !== $upload_url) ? $upload_effective_url : null,
+                    'is_html'         => (bool) preg_match('/<html/i', $body_for_log),
+                    'response_sample' => mb_substr(wp_strip_all_tags($body_for_log), 0, 300),
                 ));
-                return array('success' => false, 'message' => 'No file_id in upload response: ' . $body_for_log);
+                return array('success' => false, 'message' => 'No file_id in upload response (HTTP ' . $upload_http_code . '): ' . mb_substr(wp_strip_all_tags($body_for_log), 0, 200));
             }
 
             $this->cleanup_prepared_image($prepared, $attachment_id, $product_id);
